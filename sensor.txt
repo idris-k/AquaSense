@@ -1,0 +1,303 @@
+#include "mbed.h"
+#include <cstring>
+
+// ================================================================
+//  SMART WATER QUALITY MONITORING SYSTEM (TDS Sensor)
+//  Platform : STM32 NUCLEO (Mbed OS 6)
+//
+//  TDS = Total Dissolved Solids, measured in PPM
+//  Clean water : < 100 PPM  → GREEN
+//  Moderate    : 100–300 PPM → YELLOW
+//  Dirty       : > 300 PPM  → RED + buzzer
+// ================================================================
+
+// --- OLED Configuration ---
+#define I2C_FREQ    100000
+#define OLED_ADDR   0x3C
+#define RESET_PIN   D6
+
+I2C i2c(PB_9, PB_8);           // SDA = PB_9 (D14), SCL = PB_8 (D15)
+DigitalOut oled_reset(RESET_PIN);
+
+// --- Sensor & Actuator Pins ---
+AnalogIn turbidity(A0);         // TDS sensor analog input
+
+// RGB LED using PwmOut (matches analogWrite from reference code)
+PwmOut ledR(D2);
+PwmOut ledG(D3);
+PwmOut ledB(D4);
+
+DigitalOut buzzer(D5);          // Active buzzer
+
+// --- TDS Thresholds (PPM) ---
+// Based on reference code: < 100 PPM = clean
+#define CLEAN_PPM     100.0f    // below this → GREEN
+#define DIRTY_PPM     300.0f    // above this → RED + buzzer
+                                // between    → YELLOW
+
+// --- Sensor Settings ---
+#define SAMPLE_COUNT  10        // ADC samples to average
+#define VREF          3.3f      // STM32 reference voltage
+#define TEMPERATURE   25.0f     // Assumed water temperature (°C)
+
+// --- Display buffer: 128 x (32/8) = 512 bytes ---
+uint8_t buffer[512];
+
+// --- 5x7 Font Table ---
+static const uint8_t font5x7[96][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, {0x00,0x07,0x00,0x07,0x00},
+    {0x14,0x7F,0x14,0x7F,0x14}, {0x24,0x2A,0x7F,0x2A,0x12}, {0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50}, {0x00,0x05,0x03,0x00,0x00}, {0x00,0x1C,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x1C,0x00}, {0x14,0x08,0x3E,0x08,0x14}, {0x08,0x08,0x3E,0x08,0x08},
+    {0x00,0x50,0x30,0x00,0x00}, {0x08,0x08,0x08,0x08,0x08}, {0x00,0x60,0x60,0x00,0x00},
+    {0x20,0x10,0x08,0x04,0x02}, {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39}, {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00},
+    {0x00,0x56,0x36,0x00,0x00}, {0x08,0x14,0x22,0x41,0x00}, {0x14,0x14,0x14,0x14,0x14},
+    {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x51,0x09,0x06}, {0x32,0x49,0x79,0x41,0x3E},
+    {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00},
+    {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F}, {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43}, {0x00,0x7F,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20}, {0x00,0x41,0x41,0x7F,0x00}, {0x04,0x02,0x01,0x02,0x04},
+    {0x40,0x40,0x40,0x40,0x40}, {0x00,0x01,0x02,0x04,0x00}, {0x20,0x54,0x54,0x54,0x78},
+    {0x7F,0x48,0x44,0x44,0x38}, {0x38,0x44,0x44,0x44,0x20}, {0x38,0x44,0x44,0x48,0x7F},
+    {0x38,0x54,0x54,0x54,0x18}, {0x08,0x7E,0x09,0x01,0x02}, {0x0C,0x52,0x52,0x52,0x3E},
+    {0x7F,0x08,0x04,0x04,0x78}, {0x00,0x44,0x7D,0x40,0x00}, {0x20,0x40,0x44,0x3D,0x00},
+    {0x7F,0x10,0x28,0x44,0x00}, {0x00,0x41,0x7F,0x40,0x00}, {0x7C,0x04,0x78,0x04,0x78},
+    {0x7C,0x08,0x04,0x04,0x78}, {0x38,0x44,0x44,0x44,0x38}, {0x7C,0x14,0x14,0x14,0x08},
+    {0x08,0x14,0x14,0x18,0x7C}, {0x7C,0x08,0x04,0x04,0x08}, {0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3F,0x44,0x40,0x20}, {0x3C,0x40,0x40,0x20,0x7C}, {0x1C,0x20,0x40,0x20,0x1C},
+    {0x3C,0x40,0x30,0x40,0x3C}, {0x44,0x28,0x10,0x28,0x44}, {0x0C,0x50,0x50,0x50,0x3C},
+    {0x44,0x64,0x54,0x4C,0x44}, {0x00,0x08,0x36,0x41,0x00}, {0x00,0x00,0x7F,0x00,0x00},
+    {0x00,0x41,0x36,0x08,0x00}, {0x10,0x08,0x08,0x10,0x08}, {0x00,0x00,0x00,0x00,0x00}
+};
+
+// ================================================================
+//  OLED FUNCTIONS
+// ================================================================
+
+void oled_command(uint8_t cmd) {
+    char data[2] = {0x00, (char)cmd};
+    i2c.write(OLED_ADDR << 1, data, 2);
+}
+
+void clear_buffer() {
+    memset(buffer, 0, sizeof(buffer));
+}
+
+void draw_char(uint8_t x, uint8_t y, char c) {
+    if (c < 32 || c > 127) return;
+    uint8_t index = c - 32;
+    for (int i = 0; i < 5; i++) {
+        uint8_t colData = font5x7[index][i];
+        for (int j = 0; j < 7; j++) {
+            if (colData & (1 << j)) {
+                int px = x + i;
+                int py = y + j;
+                if (px >= 128 || py >= 32) continue;
+                int page = py / 8;
+                int bit  = py % 8;
+                buffer[page * 128 + px] |= (1 << bit);
+            }
+        }
+    }
+}
+
+void draw_text(uint8_t x, uint8_t y, const char* text) {
+    while (*text) {
+        draw_char(x, y, *text);
+        x += 6;
+        text++;
+    }
+}
+
+void update_display() {
+    for (uint8_t page = 0; page < 4; page++) {
+        oled_command(0xB0 + page);
+        oled_command(0x00);
+        oled_command(0x10);
+        char data[129];
+        data[0] = 0x40;
+        memcpy(data + 1, &buffer[page * 128], 128);
+        i2c.write(OLED_ADDR << 1, data, 129);
+    }
+}
+
+void init_oled() {
+    oled_reset = 0; wait_us(1000);
+    oled_reset = 1; wait_us(100000);
+    const uint8_t init_cmds[] = {
+        0xAE, 0xD5, 0x80, 0xA8, 0x1F, 0xD3, 0x00, 0x40,
+        0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x02,
+        0x81, 0x8F, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF
+    };
+    for (unsigned int i = 0; i < sizeof(init_cmds); i++) {
+        oled_command(init_cmds[i]);
+    }
+}
+
+// ================================================================
+//  TDS SENSOR FUNCTIONS
+// ================================================================
+
+// Read ADC 10 times and return averaged voltage
+float readAveragedVoltage() {
+    float sum = 0.0f;
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        sum += turbidity.read();        // 0.0 – 1.0
+        ThisThread::sleep_for(10ms);
+    }
+    float avgRaw = sum / SAMPLE_COUNT;
+    return avgRaw * VREF;              // Convert to voltage
+}
+
+// Convert voltage to TDS in PPM
+// Same formula used by GravityTDS library (adapted for 3.3V reference)
+float voltageToPPM(float voltage) {
+    // Temperature compensation (assumed 25°C)
+    float compensationCoeff   = 1.0f + 0.02f * (TEMPERATURE - 25.0f);
+    float compensationVoltage = voltage / compensationCoeff;
+
+    // TDS conversion formula from GravityTDS library
+    float tds = (133.42f * compensationVoltage * compensationVoltage * compensationVoltage
+               - 255.86f * compensationVoltage * compensationVoltage
+               + 857.39f * compensationVoltage) * 0.5f;
+
+    return tds;
+}
+
+// Set RGB LED colour using PWM (0.0 = off, 1.0 = full brightness)
+// Matches analogWrite(pin, 0-255) from reference Arduino code
+// Common cathode: 1.0 = ON, 0.0 = OFF
+void setRGB(float r, float g, float b) {
+    ledR = r;
+    ledG = g;
+    ledB = b;
+}
+
+// Drive RGB LED and buzzer based on water quality level
+void setStatus(int level) {
+    switch (level) {
+        case 0:                         // CLEAN → Green, buzzer off
+            setRGB(0.0f, 1.0f, 0.0f);
+            buzzer = 0;
+            break;
+        case 1:                         // MODERATE → Yellow (R+G), buzzer off
+            setRGB(1.0f, 1.0f, 0.0f);
+            buzzer = 0;
+            break;
+        case 2:                         // DIRTY → Red, buzzer on
+            setRGB(1.0f, 0.0f, 0.0f);
+            buzzer = 1;
+            break;
+        default:
+            setRGB(0.0f, 0.0f, 0.0f);
+            buzzer = 0;
+            break;
+    }
+}
+
+// ================================================================
+//  MAIN
+// ================================================================
+int main() {
+
+    // Set PWM period for RGB LEDs (20ms = 50Hz, smooth colour)
+    ledR.period(0.02f);
+    ledG.period(0.02f);
+    ledB.period(0.02f);
+
+    // Init I2C and OLED
+    i2c.frequency(I2C_FREQ);
+    init_oled();
+
+    // Startup message
+    printf("================================\r\n");
+    printf("  Smart Water Quality Monitor\r\n");
+    printf("  STM32 NUCLEO - Mbed OS 6\r\n");
+    printf("================================\r\n");
+    printf("  CLEAN    < %.0f PPM\r\n",  CLEAN_PPM);
+    printf("  MODERATE %.0f - %.0f PPM\r\n", CLEAN_PPM, DIRTY_PPM);
+    printf("  DIRTY    > %.0f PPM\r\n",  DIRTY_PPM);
+    printf("================================\r\n\r\n");
+
+    // --- LED self-test ---
+    printf("Running self-test...\r\n");
+
+    clear_buffer();
+    draw_text(10, 12, "Self Test...");
+    update_display();
+
+    setRGB(1.0f, 0.0f, 0.0f); ThisThread::sleep_for(400ms);  // Red
+    setRGB(0.0f, 1.0f, 0.0f); ThisThread::sleep_for(400ms);  // Green
+    setRGB(1.0f, 1.0f, 0.0f); ThisThread::sleep_for(400ms);  // Yellow
+    setRGB(0.0f, 0.0f, 0.0f);                                 // Off
+
+    buzzer = 1; ThisThread::sleep_for(100ms);                 // Short beep
+    buzzer = 0;
+
+    printf("Self-test done. Monitoring started.\r\n\r\n");
+
+    // ── Main monitoring loop ────────────────────────────────────
+    while (true) {
+
+        // STEP 1: Read averaged voltage from TDS sensor
+        float voltage = readAveragedVoltage();
+
+        // STEP 2: Convert voltage to PPM (same as GravityTDS library)
+        float ppm = voltageToPPM(voltage);
+
+        // Clamp negative values (can happen at very low voltages)
+        if (ppm < 0.0f) ppm = 0.0f;
+
+        // STEP 3: Classify water quality using PPM
+        // Matches reference code threshold of 100 PPM
+        const char* status;
+        int level;
+
+        if (ppm < CLEAN_PPM) {
+            status = "CLEAN";
+            level  = 0;
+        } else if (ppm < DIRTY_PPM) {
+            status = "MODERATE";
+            level  = 1;
+        } else {
+            status = "DIRTY";
+            level  = 2;
+        }
+
+        // STEP 4: Drive RGB LED and buzzer
+        setStatus(level);
+
+        // STEP 5: Update OLED display
+        // ┌──────────────────┐
+        // │ Water Quality:   │
+        // │ CLEAN            │
+        // │ 45 PPM           │
+        // └──────────────────┘
+        clear_buffer();
+
+        char ppm_str[20];
+        sprintf(ppm_str, "%.0f PPM", ppm);
+
+        draw_text(0, 0,  "Water Quality:");  // Row 1
+        draw_text(0, 12, status);            // Row 2 — status front and center
+        draw_text(0, 23, ppm_str);           // Row 3 — PPM value
+
+        update_display();
+
+        // STEP 6: Print to serial monitor
+        printf("Voltage: %.2fV | TDS: %.0f PPM | Status: %s\r\n",
+               voltage, ppm, status);
+
+        // STEP 7: Wait 1 second
+        ThisThread::sleep_for(1000ms);
+    }
+}
